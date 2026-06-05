@@ -130,53 +130,30 @@ class AlphaModel:
 
     # ---- Preprocessing ----
 
-    def preprocess(
-        self, df: pl.DataFrame, fit: bool = True,
-        stats: dict | None = None,
-    ) -> tuple[pl.DataFrame, dict]:
-        """Cross-sectional Z-score normalization per timestamp.
+    def preprocess(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Cross-sectional Z-score normalization per (date, timestamp).
 
-        For each feature, within each timestamp slice:
-          z = (x - mean) / (std + EPS)
+        For each feature, within each (date, timestamp) cross-section:
+          z = (x - mean) / std
 
-        Parameters
-        ----------
-        df : DataFrame with timestamp, feature columns.
-        fit : if True, compute stats from df. If False, apply given stats.
-        stats : pre-computed {feature: {mean_col, std_col}} for transform.
-
-        Returns
-        -------
-        (normalized_df, stats_dict)
+        Cross-sections with std near zero (e.g. all stocks at limit) are
+        clamped to 0 to avoid numerical explosion.
         """
-        if fit:
-            stats = {}
-            for col in self._feature_cols:
-                grp = df.group_by("timestamp").agg([
-                    pl.col(col).mean().alias("_mean"),
-                    pl.col(col).std().alias("_std"),
-                ])
-                stats[col] = grp
+        for col in self._feature_cols:
+            grp = df.group_by(["date", "timestamp"]).agg([
+                pl.col(col).mean().alias("_mean"),
+                pl.col(col).std().alias("_std"),
+            ])
+            df = df.join(grp, on=["date", "timestamp"], how="left")
+            df = df.with_columns(
+                pl.when(pl.col("_std") > 1e-6)
+                .then((pl.col(col) - pl.col("_mean")) / pl.col("_std"))
+                .otherwise(0.0)
+                .alias(col)
+            )
+            df = df.drop(["_mean", "_std"])
 
-            # Join means and stds back
-            for col in self._feature_cols:
-                df = df.join(stats[col], on="timestamp", how="left")
-                df = df.with_columns(
-                    ((pl.col(col) - pl.col("_mean")) / (pl.col("_std") + EPS)).alias(col)
-                )
-                df = df.drop(["_mean", "_std"])
-
-            return df, stats
-        else:
-            if stats is None:
-                raise ValueError("stats dict required when fit=False")
-            for col in self._feature_cols:
-                df = df.join(stats[col], on="timestamp", how="left")
-                df = df.with_columns(
-                    ((pl.col(col) - pl.col("_mean")) / (pl.col("_std") + EPS)).alias(col)
-                )
-                df = df.drop(["_mean", "_std"])
-            return df, stats
+        return df
 
     # ---- Data preparation ----
 
@@ -185,26 +162,24 @@ class AlphaModel:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pl.DataFrame]:
         """Extract feature matrix, target vector, stock IDs, and filtered df.
 
-        Caller should pass a DataFrame already filtered to non-null
-        rows for features + target.  Returns aligned numpy arrays
-        and the (subset) DataFrame for downstream evaluation.
-
-        Returns
-        -------
-        (X, y, stock_ids, filtered_df) — X/y/stock_ids are aligned
-        to filtered_df row order.
+        Requires a pre-computed 'stock_id' column (global integer encoding of
+        SecurityID) in the input DataFrame.  Caller is responsible for creating
+        this column once on the full dataset before any train/val/test split.
         """
         valid = df.drop_nulls(subset=[self._target_col] + self._feature_cols)
 
         X = valid.select(self._feature_cols).to_numpy().astype(np.float64)
         y = valid.select(self._target_col).to_numpy().ravel().astype(np.float64)
 
-        stock_ids = (
-            valid.select(pl.col("SecurityID").cast(pl.Categorical).to_physical())
-            .to_numpy()
-            .ravel()
-            .astype(np.int32)
-        )
+        if "stock_id" in valid.columns:
+            stock_ids = valid.select("stock_id").to_numpy().ravel().astype(np.int32)
+        else:
+            raise KeyError(
+                "Input DataFrame is missing 'stock_id' column. "
+                "Create it once on the full dataset with: "
+                "df.with_columns(pl.col('SecurityID').cast(pl.Categorical)"
+                ".to_physical().cast(pl.Int32).alias('stock_id'))"
+            )
 
         return X, y, stock_ids, valid
 
@@ -305,9 +280,10 @@ class AlphaModel:
                 continue
 
             # Preprocess (Z-score normalize)
-            train_df, stats = self.preprocess(train_df, fit=True)
-            val_df, _ = self.preprocess(val_df, fit=False, stats=stats)
-            test_df, _ = self.preprocess(test_df, fit=False, stats=stats)
+            train_df = self.preprocess(train_df)
+            if val_df.height > 0:
+                val_df = self.preprocess(val_df)
+            test_df = self.preprocess(test_df)
 
             # Extract arrays
             X_train, y_train, _, _ = self.prepare_data(train_df)
