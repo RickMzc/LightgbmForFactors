@@ -4,8 +4,8 @@ Module 1: Data Loader & 3s Grid Aligner
 Polars lazy-scan parquet, column pruning, 3s time bucketing,
 SH+SZ market merge.
 
-Trade/order data aggregation onto the snap 3s grid is handled
-by TradeAggregator (for future multi-source fusion).
+Trade/order aggregation onto the snap 3s grid is handled in
+feature_factory.py (ceil bucketing + asof-join backward).
 """
 
 from __future__ import annotations
@@ -190,75 +190,3 @@ class SnapDataLoader:
         df = df.sort(["SecurityID", "timestamp"])
 
         return df
-
-
-class TradeAggregator:
-    """Aggregate tick-level trade/order data into 3s bins,
-    then asof-join backward onto the snap grid.
-
-    This is the ONLY place join_asof is allowed — it fuses raw
-    trade data onto the aligned grid.  Cached factor joins use
-    exact joins only.
-    """
-
-    @staticmethod
-    def aggregate_trades_to_3s(
-        trade_lf: pl.LazyFrame,
-        snap_timestamps: pl.DataFrame,
-    ) -> pl.DataFrame:
-        """Group trade records into 3s bins by SecurityID,
-        compute interval stats, join_asof backward onto snap grid.
-
-        Parameters
-        ----------
-        trade_lf: LazyFrame of trade data (must have TradTime, SecurityID).
-        snap_timestamps: DataFrame with columns [SecurityID, timestamp]
-                         representing the 3s grid to align onto.
-
-        Returns
-        -------
-        DataFrame with trade aggregations at each snap grid point.
-        """
-        # Parse trade time to 3s bucket (explicit i32 casts prevent overflow)
-        ts_p = pl.col("TradTime").str.slice(0, 8).str.to_time("%H:%M:%S")
-        trade_with_bucket = trade_lf.with_columns(
-            (
-                ts_p.dt.hour().cast(pl.Int32) * 3600
-                + ts_p.dt.minute().cast(pl.Int32) * 60
-                + (ts_p.dt.second().cast(pl.Int32) // 3) * 3
-            )
-            .cast(pl.Int32)
-            .alias("trade_bucket")
-        )
-
-        # Aggregate per (SecurityID, 3s bucket)
-        agg_exprs = [
-            pl.col("TradPrice").mean().alias("trade_vwap"),
-            pl.col("TradVolume").sum().alias("trade_volume"),
-            pl.col("TradeMoney").sum().alias("trade_turnover"),
-            pl.col("TradeBSFlag").count().alias("trade_ticks"),
-            (pl.col("TradeBSFlag") == "B").sum().alias("trade_buy_count"),
-            (pl.col("TradeBSFlag") == "S").sum().alias("trade_sell_count"),
-        ]
-        trade_agg = (
-            trade_with_bucket
-            .group_by("SecurityID", "trade_bucket")
-            .agg(agg_exprs)
-            .sort(["SecurityID", "trade_bucket"])
-            .collect()
-        )
-
-        # asof backward join: attach the most recent completed 3s bin's
-        # trade stats to each snap timestamp (no look-ahead).
-        result = (
-            snap_timestamps
-            .join_asof(
-                trade_agg,
-                left_on="timestamp",
-                right_on="trade_bucket",
-                by="SecurityID",
-                strategy="backward",
-            )
-        )
-
-        return result
