@@ -60,6 +60,8 @@ def run_single_day(
     Column requirements are gathered from the feature registry upfront
     so the parquet is scanned only once.
     """
+    import polars as pl
+
     if feature_names is None:
         feature_names = sorted(feature_registry.keys())
 
@@ -78,6 +80,9 @@ def run_single_day(
     # ---- Step 1: Load with all needed columns ----
     t1 = time.time()
     df = loader.load_day_merged(date, columns=sorted(all_required))
+    # Inject date IMMEDIATELY so feature factory's _time_group() can
+    # use ["SecurityID", "date"] to prevent cross-day contamination.
+    df = df.with_columns(pl.lit(date).alias("date"))
     load_time = time.time() - t1
     if verbose:
         print(f"[{date}] Load: {df.height:,} rows, {len(all_required)} cols ({load_time:.0f}s)", flush=True)
@@ -140,15 +145,19 @@ def run_baseline(
     t_start = time.time()
 
     # ---- Stage 1-3: Data + Labels + Features ----
+    import polars as pl
     all_dfs: list[pl.DataFrame] = []
     for date in dates:
-        import polars as pl
         result = run_single_day(date, feature_names, target_col, use_cache)
-        result["df"] = result["df"].with_columns(pl.lit(date).alias("date"))
         all_dfs.append(result["df"])
 
-    import polars as pl
     full_df = pl.concat(all_dfs, how="vertical")
+
+    # Global integer stock_id, computed once before any train/val/test split.
+    # This guarantees SecurityID → int mapping is consistent across all folds.
+    full_df = full_df.with_columns(
+        pl.col("SecurityID").cast(pl.Categorical).to_physical().cast(pl.Int32).alias("stock_id")
+    )
     n_total = full_df.height
 
     print(f"\nFull dataset: {n_total:,} rows, {full_df['date'].n_unique()} days")
