@@ -198,6 +198,7 @@ def run_baseline(
             preds, multi_labels,
             aligned_test["timestamp"],
             aligned_test["SecurityID"],
+            dates=aligned_test["date"],
         )
         evaluator.print_summary(results)
 

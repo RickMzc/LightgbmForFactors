@@ -46,12 +46,14 @@ class SnapDataLoader:
     """
 
     # SZ column name → SH column name mapping
-    _SZ_TO_SH_RENAME: dict[str, str] = {
+    _SZ_TO_SH: dict[str, str] = {
         "TotalBidQty": "TotalBidVol",
         "TotalOfferQty": "TotalAskVol",
         "TurnNum": "TradNumber",
         "Volume": "TradVolume",
     }
+    # Reverse: SH column name → SZ column name (for parquet scan lookup)
+    _SH_TO_SZ: dict[str, str] = {v: k for k, v in _SZ_TO_SH.items()}
 
     # Columns that exist in SH but not SZ (will be null-filled for SZ)
     _SH_ONLY_COLS: set[str] = {"MaxBidDur", "MaxSellDur", "TotBidNum", "TotSellNum"}
@@ -85,11 +87,12 @@ class SnapDataLoader:
         scan = pl.scan_parquet(path)
         parquet_cols = set(scan.collect_schema().names())
 
-        # For SZ: translate SH column names to SZ equivalents
+        # For SZ: translate unified SH column names → SZ parquet column names
         if market == "sz":
             scan_cols: list[str] = []
             for c in cols:
-                sz_c = self._SZ_TO_SH_RENAME.get(c, c)
+                # SH→SZ lookup: reverse of the rename mapping
+                sz_c = self._SH_TO_SZ.get(c, c)
                 if sz_c in parquet_cols:
                     scan_cols.append(sz_c)
                 # else: column not in this market's parquet → skip, will null-fill
@@ -111,7 +114,8 @@ class SnapDataLoader:
 
         # Rename SZ columns → SH names
         if market == "sz":
-            rename_map = {v: k for k, v in self._SZ_TO_SH_RENAME.items() if v in df.columns}
+            # Apply forward mapping: SZ name in df → SH name
+            rename_map = {k: v for k, v in self._SZ_TO_SH.items() if k in df.columns}
             if rename_map:
                 df = df.rename(rename_map)
 

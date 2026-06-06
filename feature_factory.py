@@ -1113,7 +1113,7 @@ def _compute_is_gap_limit_down(df: pl.DataFrame) -> pl.DataFrame:
         df.sort("timestamp").group_by(g_key)
         .agg(is_down.first().alias("_first_down"))
     )
-    df = df.join(first_down, on="SecurityID", how="left")
+    df = df.join(first_down, on=g_key, how="left")
     return df.with_columns(
         (is_down & pl.col("_first_down")).cast(pl.Int32).alias("IsGapLimitDown")
     ).drop("_first_down")
@@ -1334,16 +1334,11 @@ def _aggregate_trades(df: pl.DataFrame, snap_prices: pl.DataFrame | None = None,
         _ceil_3s(trade_secs).alias("timestamp"),
     ])
 
-    # Large trade threshold: use previous day if available, else same-day
+    # Large trade threshold: previous day only, no same-day fallback (future leak).
     if prev_thresholds is not None and prev_thresholds.height > 0:
         df = df.join(prev_thresholds, on="SecurityID", how="left")
-        df = df.with_columns(pl.col("large_thresh").fill_null(pl.col("TradeMoney").max().over("SecurityID") * 2))
     else:
-        same_day_thresh = (
-            df.group_by("SecurityID")
-            .agg(pl.col("TradeMoney").quantile(0.90).alias("large_thresh"))
-        )
-        df = df.join(same_day_thresh, on="SecurityID", how="left")
+        df = df.with_columns(pl.lit(None).cast(pl.Float64).alias("large_thresh"))
 
     is_buy = pl.col("TradeBSFlag") == "B"
     is_sell = pl.col("TradeBSFlag") == "S"
@@ -1482,6 +1477,11 @@ def _load_and_agg_trade(date: str, snap_prices: pl.DataFrame | None = None,
 
 # ---- Trade-derived registered features ----
 
+# Trade features need snap prices for penetration/asof-join and mid_price for VWAP dev
+_TRADE_REQUIRED_COLS = ["UpdateTime", "BidPrice1", "AskPrice1", "mid_price"]
+# Order features need snap prices for depth computation and mid_price for aggressiveness
+_ORDER_REQUIRED_COLS = ["BidPrice1", "AskPrice1", "mid_price"]
+
 def _get_prev_date(date: str) -> str | None:
     """Get previous trading date from available snap directories."""
     import os as _os
@@ -1495,7 +1495,7 @@ def _get_prev_date(date: str) -> str | None:
     return all_dates[idx - 1] if idx > 0 else None
 
 
-def _load_prev_thresholds(date: str) -> pl.DataFrame | None:
+def _load_prev_trade_thresholds(date: str) -> pl.DataFrame | None:
     """Load previous day's per-stock 90th percentile trade amount thresholds."""
     prev = _get_prev_date(date)
     if prev is None:
@@ -1507,8 +1507,8 @@ def _load_prev_thresholds(date: str) -> pl.DataFrame | None:
     return pl.read_parquet(path)
 
 
-def _save_thresholds(df: pl.DataFrame, date: str) -> None:
-    """Save per-stock 90th percentile thresholds for next day's use."""
+def _save_trade_thresholds(df: pl.DataFrame, date: str) -> None:
+    """Save per-stock 90th percentile trade thresholds for next day's use."""
     import os as _os
     out_dir = "/fast1/user001/factor_values/_trade_thresh"
     _os.makedirs(out_dir, exist_ok=True)
@@ -1516,6 +1516,34 @@ def _save_thresholds(df: pl.DataFrame, date: str) -> None:
         pl.col("TradeMoney").quantile(0.90).alias("large_thresh")
     )
     thresh.write_parquet(f"{out_dir}/{date}.parquet", compression="zstd")
+
+
+def _load_prev_order_thresholds(date: str) -> pl.DataFrame | None:
+    """Load previous day's per-stock 90th percentile order amount thresholds."""
+    prev = _get_prev_date(date)
+    if prev is None:
+        return None
+    path = f"/fast1/user001/factor_values/_order_thresh/{prev}.parquet"
+    import os as _os
+    if not _os.path.exists(path):
+        return None
+    return pl.read_parquet(path)
+
+
+def _save_order_thresholds(df: pl.DataFrame, date: str) -> None:
+    """Save per-stock 90th percentile order amount thresholds for next day's use."""
+    import os as _os
+    out_dir = "/fast1/user001/factor_values/_order_thresh"
+    _os.makedirs(out_dir, exist_ok=True)
+    thresh = df.group_by("SecurityID").agg(
+        (pl.col("OrderPrice") * pl.col("Balance")).quantile(0.90).alias("large_thresh")
+    )
+    thresh.write_parquet(f"{out_dir}/{date}.parquet", compression="zstd")
+
+
+# Backward compatibility aliases
+_load_prev_thresholds = _load_prev_trade_thresholds
+_save_thresholds = _save_trade_thresholds
 
 
 def _join_trade_stats(df: pl.DataFrame, date: str) -> pl.DataFrame:
@@ -1532,20 +1560,19 @@ def _join_trade_stats(df: pl.DataFrame, date: str) -> pl.DataFrame:
         _join_trade_stats._cache = {}
     if cache_key not in _join_trade_stats._cache:
         t0 = _time.time()
-        # Snap prices with original UpdateTime for asof-join (not 3s bucket)
-        if "UpdateTime" in df.columns:
-            snap_prices = df.select([
-                "SecurityID", "timestamp", "UpdateTime", "BidPrice1", "AskPrice1", "mid_price"
-            ]).unique(subset=["SecurityID", "timestamp"]).with_columns(
-                pl.col("UpdateTime").alias("_snap_time")
+        # Snap prices with original UpdateTime for asof-join (not 3s bucket).
+        # UpdateTime is a declared required_col — missing means caller error.
+        if "UpdateTime" not in df.columns:
+            raise KeyError(
+                "_join_trade_stats requires 'UpdateTime' column for asof-join. "
+                "Ensure _TRADE_REQUIRED_COLS is in the feature registry."
             )
-        else:
-            snap_prices = df.select([
-                "SecurityID", "timestamp", "BidPrice1", "AskPrice1", "mid_price"
-            ]).unique(subset=["SecurityID", "timestamp"]).with_columns(
-                pl.lit("09:30:00.000").alias("_snap_time")
-            )
-        prev_thresh = _load_prev_thresholds(date)
+        snap_prices = df.select([
+            "SecurityID", "timestamp", "UpdateTime", "BidPrice1", "AskPrice1", "mid_price"
+        ]).unique(subset=["SecurityID", "timestamp"]).with_columns(
+            pl.col("UpdateTime").alias("_snap_time")
+        )
+        prev_thresh = _load_prev_trade_thresholds(date)
         trade_agg = _load_and_agg_trade(date, snap_prices, prev_thresh)
         # Save thresholds for next day
         sh_path = f"/fast1/user001/stock_data/type=trade_sh/date={date}/data.parquet"
@@ -1565,7 +1592,7 @@ def _join_trade_stats(df: pl.DataFrame, date: str) -> pl.DataFrame:
                 raw_trade = pl.concat([raw_sh, raw_sz], how="vertical")
             else:
                 raw_trade = raw_sh
-            _save_thresholds(raw_trade, date)
+            _save_trade_thresholds(raw_trade, date)
         _join_trade_stats._cache = {cache_key: trade_agg}
         elapsed = _time.time() - t0
         print(f"  Trade agg: {trade_agg.height:,} rows ({elapsed:.0f}s)", flush=True)
@@ -1574,7 +1601,7 @@ def _join_trade_stats(df: pl.DataFrame, date: str) -> pl.DataFrame:
     return df.join(trade_agg, on=["SecurityID", "timestamp"], how="left")
 
 
-@register("TradeImb", required_cols=[])
+@register("TradeImb", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_trade_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Trade imbalance: (BuyAmt - SellAmt) / (BuyAmt + SellAmt) per 3s bucket."""
     df = _join_trade_stats(df, date)
@@ -1586,7 +1613,7 @@ def _compute_trade_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("TradeVWAPDev", required_cols=[])
+@register("TradeVWAPDev", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_trade_vwap_dev(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Trade VWAP deviation from mid-price (snap mid_price must already exist)."""
     df = _join_trade_stats(df, date)
@@ -1598,7 +1625,7 @@ def _compute_trade_vwap_dev(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("TradeIntensity", required_cols=[])
+@register("TradeIntensity", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_trade_intensity(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Raw trade count per 3s bucket."""
     df = _join_trade_stats(df, date)
@@ -1607,7 +1634,7 @@ def _compute_trade_intensity(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("LargeTradeRatio", required_cols=[])
+@register("LargeTradeRatio", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_large_trade_ratio(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Large trade imbalance: (LargeBuy - LargeSell) / (LargeBuy + LargeSell).
 
@@ -1622,21 +1649,21 @@ def _compute_large_trade_ratio(df: pl.DataFrame, date: str = "") -> pl.DataFrame
     )
 
 
-@register("TradePriceDev", required_cols=[])
+@register("TradePriceDev", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_trade_price_dev(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Mean |TradePrice - mid| / mid within 3s bucket."""
     df = _join_trade_stats(df, date)
     return df.with_columns(pl.col("trade_price_dev").alias("TradePriceDev"))
 
 
-@register("TradePriceDispersion", required_cols=[])
+@register("TradePriceDispersion", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_trade_price_dispersion(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """CV of trade prices within 3s bucket."""
     df = _join_trade_stats(df, date)
     return df.with_columns(pl.col("trade_price_dispersion").alias("TradePriceDispersion"))
 
 
-@register("TradePenetration", required_cols=[])
+@register("TradePenetration", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_trade_penetration(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Net penetration: (penBuyAmt - penSellAmt) / totalTradeAmt."""
     df = _join_trade_stats(df, date)
@@ -1648,16 +1675,17 @@ def _compute_trade_penetration(df: pl.DataFrame, date: str = "") -> pl.DataFrame
     )
 
 
-@register("TradeIntensityZ", required_cols=[])
+@register("TradeIntensityZ", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_trade_intensity_z(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
-    """Z-score of TradeCount per timestamp (cross-sectional)."""
+    """Z-score of TradeCount per (date, timestamp) cross-section."""
     df = _join_trade_stats(df, date)
     tc = pl.col("trade_count").fill_null(0.0)
-    grp = df.group_by("timestamp").agg([
+    g_cols = ["date", "timestamp"] if "date" in df.columns else ["timestamp"]
+    grp = df.group_by(g_cols).agg([
         tc.median().alias("_med"),
         (tc - tc.median()).abs().median().alias("_mad"),
     ])
-    df = df.join(grp, on="timestamp", how="left")
+    df = df.join(grp, on=g_cols, how="left")
     return df.with_columns(
         pl.when(pl.col("_mad") > 0)
         .then((tc - pl.col("_med")) / (pl.col("_mad") * 1.4826))
@@ -1665,7 +1693,7 @@ def _compute_trade_intensity_z(df: pl.DataFrame, date: str = "") -> pl.DataFrame
     ).drop(["_med", "_mad"])
 
 
-@register("ConsecutiveBS", required_cols=[])
+@register("ConsecutiveBS", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_consecutive_bs(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """(maxConsecBuy - maxConsecSell) / (maxConsecBuy + maxConsecSell)."""
     df = _join_trade_stats(df, date)
@@ -1677,7 +1705,7 @@ def _compute_consecutive_bs(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("BuySellCountImb", required_cols=[])
+@register("BuySellCountImb", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_buy_sell_count_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """(BuyCnt - SellCnt) / (BuyCnt + SellCnt)."""
     df = _join_trade_stats(df, date)
@@ -1733,28 +1761,32 @@ def _load_order_sz(date: str) -> pl.DataFrame:
     ])
 
 
-def _aggregate_orders(df: pl.DataFrame, snap_prices: pl.DataFrame | None = None) -> pl.DataFrame:
+def _aggregate_orders(df: pl.DataFrame, snap_prices: pl.DataFrame | None = None,
+                      prev_thresholds: pl.DataFrame | None = None) -> pl.DataFrame:
     """Aggregate tick order data to 3s buckets per stock.
+
+    Uses ceil-bucketing (right-endpoint, matching trade convention).
+    Large-order threshold: previous day only (no same-day fallback).
 
     If snap_prices provided (SecurityID, timestamp, BidPrice1, AskPrice1),
     also computes OrderDepthPos (which level the order sits at).
+    Depth stats are computed on NEW ORDERS ONLY (is_new), not cancels.
     """
-    ts = pl.col("OrderTime").str.slice(0, 8).str.to_time("%H:%M:%S")
-    df = df.with_columns(
-        (ts.dt.hour().cast(pl.Int32) * 3600
-         + ts.dt.minute().cast(pl.Int32) * 60
-         + (ts.dt.second().cast(pl.Int32) // 3) * 3
-         ).cast(pl.Int32).alias("timestamp")
-    )
+    # Parse OrderTime to seconds with millisecond precision, then ceil to 3s
+    order_secs = _parse_time_float(pl.col("OrderTime"))
+    df = df.with_columns([
+        order_secs.alias("_order_secs"),
+        _ceil_3s(order_secs).alias("timestamp"),
+    ])
 
     # Order amount = Price × Qty (金额口径).  SZ market orders (Price=0) → amt=0.
     order_amt = pl.col("OrderPrice") * pl.col("Balance")
 
-    large_thresh = (
-        df.group_by("SecurityID")
-        .agg(order_amt.quantile(0.90).alias("large_thresh"))
-    )
-    df = df.join(large_thresh, on="SecurityID", how="left")
+    # Large order threshold: previous day only, no same-day fallback
+    if prev_thresholds is not None and prev_thresholds.height > 0:
+        df = df.join(prev_thresholds, on="SecurityID", how="left")
+    else:
+        df = df.with_columns(pl.lit(None).cast(pl.Float64).alias("large_thresh"))
 
     is_new = pl.col("OrderType") == "A"
     is_cancel = pl.col("OrderType") == "D"
@@ -1785,7 +1817,7 @@ def _aggregate_orders(df: pl.DataFrame, snap_prices: pl.DataFrame | None = None)
         (is_new & is_sell & is_large).cast(pl.Int64).sum().alias("large_new_sell_cnt"),
         (is_cancel & is_buy & is_large).cast(pl.Int64).sum().alias("large_cancel_buy_cnt"),
         (is_cancel & is_sell & is_large).cast(pl.Int64).sum().alias("large_cancel_sell_cnt"),
-        # Volume-weighted average price (fixes #13)
+        # Volume-weighted average price
         (pl.col("OrderPrice") * pl.col("Balance")).filter(is_new & is_buy & has_price).sum().alias("vwap_num_buy"),
         pl.col("Balance").filter(is_new & is_buy & has_price).sum().alias("vwap_den_buy"),
         (pl.col("OrderPrice") * pl.col("Balance")).filter(is_new & is_sell & has_price).sum().alias("vwap_num_sell"),
@@ -1795,13 +1827,26 @@ def _aggregate_orders(df: pl.DataFrame, snap_prices: pl.DataFrame | None = None)
         pl.when(pl.col("vwap_den_sell") > 0).then(pl.col("vwap_num_sell") / pl.col("vwap_den_sell")).otherwise(None).alias("avg_price_new_sell"),
     ]).drop(["vwap_num_buy", "vwap_den_buy", "vwap_num_sell", "vwap_den_sell"])
 
-    # OrderDepthPos: (BidP1 - OrderPrice)/TickSize for buys, (OrderPrice - AskP1)/TickSize for sells
+    # OrderDepthPos: computed on NEW ORDERS ONLY, with tick-level asof join to snap
     if snap_prices is not None:
-        df = df.join(snap_prices, on=["SecurityID", "timestamp"], how="left")
+        # Asof-join: each order gets the most recent snap BEFORE it (backward)
+        # using the order's raw event time (_order_secs), not the ceil bucket.
+        sp = snap_prices.select([
+            "SecurityID", "timestamp", "BidPrice1", "AskPrice1"
+        ]).with_columns(
+            pl.col("timestamp").cast(pl.Float64).alias("_snap_secs")
+        )
+        df = df.sort(["SecurityID", "_order_secs"])
+        sp_sorted = sp.sort(["SecurityID", "_snap_secs"])
+        df = df.join_asof(
+            sp_sorted,
+            left_on="_order_secs", right_on="_snap_secs",
+            by="SecurityID", strategy="backward"
+        )
         tick = pl.lit(0.01)
-        # Only valid when best price > 0 AND order price > 0 AND depth within reasonable range
-        valid_buy = is_buy & has_price & (pl.col("BidPrice1") > 0) & (pl.col("BidPrice1") > pl.col("OrderPrice") - 100)
-        valid_sell = is_sell & has_price & (pl.col("AskPrice1") > 0) & (pl.col("OrderPrice") < pl.col("AskPrice1") + 100)
+        # NEW ORDERS ONLY for depth stats (not cancels)
+        valid_buy = is_new & is_buy & has_price & (pl.col("BidPrice1") > 0)
+        valid_sell = is_new & is_sell & has_price & (pl.col("AskPrice1") > 0)
         buy_depth = pl.when(valid_buy).then(
             (pl.col("BidPrice1") - pl.col("OrderPrice")) / tick
         ).otherwise(None)
@@ -1829,14 +1874,15 @@ def _aggregate_orders(df: pl.DataFrame, snap_prices: pl.DataFrame | None = None)
     return agg
 
 
-def _load_and_agg_order(date: str, snap_prices: pl.DataFrame | None = None) -> pl.DataFrame:
+def _load_and_agg_order(date: str, snap_prices: pl.DataFrame | None = None,
+                        prev_thresholds: pl.DataFrame | None = None) -> pl.DataFrame:
     """Load SH+SZ order data, normalize, aggregate to 3s."""
     frames = []
     for mkt, loader in [("sh", _load_order_sh), ("sz", _load_order_sz)]:
         try:
             o = loader(date)
             o = o.sort(["SecurityID", "OrderTime", "OrderIndex"])
-            frames.append(_aggregate_orders(o, snap_prices))
+            frames.append(_aggregate_orders(o, snap_prices, prev_thresholds))
         except FileNotFoundError:
             continue
 
@@ -1851,7 +1897,11 @@ def _load_and_agg_order(date: str, snap_prices: pl.DataFrame | None = None) -> p
 
 
 def _join_order_stats(df: pl.DataFrame, date: str) -> pl.DataFrame:
-    """Load & aggregate order data, join onto snap df (idempotent)."""
+    """Load & aggregate order data, join onto snap df (idempotent).
+
+    Uses previous trading day's large-order thresholds to avoid look-ahead.
+    Saves current day's thresholds for next day's use.
+    """
     if "new_buy_amt" in df.columns:
         return df
     cache_key = f"_order_agg_{date}"
@@ -1862,7 +1912,25 @@ def _join_order_stats(df: pl.DataFrame, date: str) -> pl.DataFrame:
         snap_prices = df.select([
             "SecurityID", "timestamp", "BidPrice1", "AskPrice1"
         ]).unique(subset=["SecurityID", "timestamp"])
-        _join_order_stats._cache = {cache_key: _load_and_agg_order(date, snap_prices)}
+        prev_thresh = _load_prev_order_thresholds(date)
+        _join_order_stats._cache = {cache_key: _load_and_agg_order(date, snap_prices, prev_thresh)}
+        # Save current day's order thresholds for next day
+        sh_path = f"/fast1/user001/stock_data/type=order_sh/date={date}/data.parquet"
+        if os.path.exists(sh_path):
+            raw_sh = pl.read_parquet(sh_path).select([
+                pl.col("SecurityID"),
+                (pl.col("OrderPrice").cast(pl.Float64) * pl.col("Balance").cast(pl.Float64)).alias("OrderAmount"),
+            ])
+            raw_sz_path = f"/fast1/user001/stock_data/type=order_sz/date={date}/data.parquet"
+            if os.path.exists(raw_sz_path):
+                raw_sz = pl.read_parquet(raw_sz_path).select([
+                    pl.col("SecurityID"),
+                    (pl.col("OrderPrice").cast(pl.Float64) * pl.col("Balance").cast(pl.Float64)).alias("OrderAmount"),
+                ])
+                raw_order = pl.concat([raw_sh, raw_sz], how="vertical")
+            else:
+                raw_order = raw_sh
+            _save_order_thresholds(raw_order, date)
         elapsed = _time.time() - t0
         print(f"  Order agg: {_join_order_stats._cache[cache_key].height:,} rows ({elapsed:.0f}s)", flush=True)
     return df.join(_join_order_stats._cache[cache_key], on=["SecurityID", "timestamp"], how="left")
@@ -1870,7 +1938,7 @@ def _join_order_stats(df: pl.DataFrame, date: str) -> pl.DataFrame:
 
 # ---- Order-derived registered features ----
 
-@register("CancelRateImb", required_cols=[])
+@register("CancelRateImb", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_cancel_rate_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Cancel rate imbalance: BuyCancelRate - SellCancelRate.
 
@@ -1888,7 +1956,7 @@ def _compute_cancel_rate_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     return df.with_columns((buy_rate - sell_rate).alias("CancelRateImb"))
 
 
-@register("OrderImb", required_cols=[])
+@register("OrderImb", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_order_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """New order imbalance: (NewBuy - NewSell) / (NewBuy + NewSell)."""
     df = _join_order_stats(df, date)
@@ -1900,7 +1968,7 @@ def _compute_order_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("LargeOrderImb", required_cols=[])
+@register("LargeOrderImb", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_large_order_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Large new order imbalance: (LargeNewBuy - LargeNewSell) / (LargeNewBuy + LargeNewSell)."""
     df = _join_order_stats(df, date)
@@ -1912,7 +1980,7 @@ def _compute_large_order_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("OrderAggress", required_cols=[])
+@register("OrderAggress", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_order_aggress(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Order aggressiveness: how far new order prices are from mid.
 
@@ -1933,7 +2001,7 @@ def _compute_order_aggress(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     return df.with_columns((aggr_buy - aggr_sell).alias("OrderAggress"))
 
 
-@register("LargeCancelImb", required_cols=[])
+@register("LargeCancelImb", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_large_cancel_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Large cancel imbalance: (LargeCancelBuy - LargeCancelSell) / sum."""
     df = _join_order_stats(df, date)
@@ -1945,7 +2013,7 @@ def _compute_large_cancel_imb(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("OrderDepthPos", required_cols=[])
+@register("OrderDepthPos", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_order_depth_pos(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Avg depth position: (avgDepthBuy - avgDepthSell) / (avgDepthBuy + avgDepthSell).
 
@@ -1963,7 +2031,7 @@ def _compute_order_depth_pos(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
 
 # --- Standalone cancel rates ---
 
-@register("BuyCancelRate", required_cols=[])
+@register("BuyCancelRate", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_buy_cancel_rate(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Buy-side cancel rate: CancelBuyCnt / (NewBuyCnt + CancelBuyCnt)."""
     df = _join_order_stats(df, date)
@@ -1974,7 +2042,7 @@ def _compute_buy_cancel_rate(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("SellCancelRate", required_cols=[])
+@register("SellCancelRate", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_sell_cancel_rate(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Sell-side cancel rate."""
     df = _join_order_stats(df, date)
@@ -1985,7 +2053,7 @@ def _compute_sell_cancel_rate(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     )
 
 
-@register("LargeBuyCancelRate", required_cols=[])
+@register("LargeBuyCancelRate", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_large_buy_cancel_rate(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Large-order buy cancel rate."""
     df = _join_order_stats(df, date)
@@ -1996,7 +2064,7 @@ def _compute_large_buy_cancel_rate(df: pl.DataFrame, date: str = "") -> pl.DataF
     )
 
 
-@register("LargeSellCancelRate", required_cols=[])
+@register("LargeSellCancelRate", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_large_sell_cancel_rate(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Large-order sell cancel rate."""
     df = _join_order_stats(df, date)
@@ -2009,7 +2077,7 @@ def _compute_large_sell_cancel_rate(df: pl.DataFrame, date: str = "") -> pl.Data
 
 # --- Order depth distribution ---
 
-@register("OrderDepthBestFrac", required_cols=[])
+@register("OrderDepthBestFrac", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_order_depth_best_frac(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Fraction of new orders at ≤1 tick from best price (most aggressive/passive boundary)."""
     df = _join_order_stats(df, date)
@@ -2022,7 +2090,7 @@ def _compute_order_depth_best_frac(df: pl.DataFrame, date: str = "") -> pl.DataF
     )
 
 
-@register("OrderDepthDeepFrac", required_cols=[])
+@register("OrderDepthDeepFrac", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_order_depth_deep_frac(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Fraction of new orders >5 ticks from best price (deep/passive)."""
     df = _join_order_stats(df, date)
@@ -2137,7 +2205,7 @@ def _compute_up_vol_ratio(df: pl.DataFrame) -> pl.DataFrame:
 
 # --- AvgTradeSize: 单笔均额 ---
 
-@register("AvgTradeSize", required_cols=[])
+@register("AvgTradeSize", required_cols=_TRADE_REQUIRED_COLS)
 def _compute_avg_trade_size(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     df = _join_trade_stats(df, date)
     total_amt = pl.col("trade_buy_amt").fill_null(0.0) + pl.col("trade_sell_amt").fill_null(0.0)
@@ -2149,7 +2217,7 @@ def _compute_avg_trade_size(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
 
 # --- OrderArrivalIntensity: 委托到达强度 (笔/秒) ---
 
-@register("MarketOrderFrac", required_cols=[])
+@register("MarketOrderFrac", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_market_order_frac(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """Fraction of new orders that are market orders (Price=0 or null)."""
     df = _join_order_stats(df, date)
@@ -2160,7 +2228,7 @@ def _compute_market_order_frac(df: pl.DataFrame, date: str = "") -> pl.DataFrame
     )
 
 
-@register("OrderArrivalIntensity", required_cols=[])
+@register("OrderArrivalIntensity", required_cols=_ORDER_REQUIRED_COLS)
 def _compute_order_arrival_intensity(df: pl.DataFrame, date: str = "") -> pl.DataFrame:
     """New orders per second: (new_buy_cnt + new_sell_cnt) / 3."""
     df = _join_order_stats(df, date)
@@ -2181,14 +2249,16 @@ import numpy as _np
 
 
 def _ofi_pca_per_timestamp(group: pl.DataFrame) -> pl.DataFrame:
-    """PCA of OFI across stocks within a single timestamp.
+    """PCA of OFI across stocks within a single (date, timestamp) cross-section.
 
-    Input group has columns: SecurityID, OFI_1, OFI, OFI_10.
-    Returns: SecurityID, timestamp, OFI_PC1, OFI_Residual, OFI_PC1_Var.
+    Input group has columns: SecurityID, [date,] timestamp, OFI_1, OFI, OFI_10.
+    Returns: SecurityID, [date,] timestamp, OFI_PC1, OFI_Residual, OFI_PC1_Var.
     """
     n = group.height
+    has_date = "date" in group.columns
+    base_cols = ["SecurityID", "date", "timestamp"] if has_date else ["SecurityID", "timestamp"]
     if n < 20:  # too few stocks for meaningful PCA
-        return group.select(["SecurityID", "timestamp"]).with_columns([
+        return group.select(base_cols).with_columns([
             pl.lit(None).alias("OFI_PC1"),
             pl.lit(None).alias("OFI_Residual"),
             pl.lit(None).alias("OFI_PC1_Var"),
@@ -2200,7 +2270,7 @@ def _ofi_pca_per_timestamp(group: pl.DataFrame) -> pl.DataFrame:
     # Drop rows with any NaN
     valid = ~_np.isnan(X).any(axis=1)
     if valid.sum() < 20:
-        return group.select(["SecurityID", "timestamp"]).with_columns([
+        return group.select(base_cols).with_columns([
             pl.lit(None).alias("OFI_PC1"),
             pl.lit(None).alias("OFI_Residual"),
             pl.lit(None).alias("OFI_PC1_Var"),
@@ -2208,7 +2278,6 @@ def _ofi_pca_per_timestamp(group: pl.DataFrame) -> pl.DataFrame:
 
     Xv = X[valid]
     sec_ids = group["SecurityID"].to_numpy()[valid]
-    ts = group["timestamp"][0]
 
     # Z-score standardize
     mean = Xv.mean(axis=0)
@@ -2233,13 +2302,16 @@ def _ofi_pca_per_timestamp(group: pl.DataFrame) -> pl.DataFrame:
     residual = Z - pc1_proj[:, None] * pc1_vec[None, :]
     resid_norm = _np.sqrt((residual ** 2).sum(axis=1))  # n-vector
 
-    return pl.DataFrame({
+    out = {
         "SecurityID": sec_ids,
-        "timestamp": [ts] * len(sec_ids),
+        "timestamp": [group["timestamp"][0]] * len(sec_ids),
         "OFI_PC1": pc1_proj,
         "OFI_Residual": resid_norm,
         "OFI_PC1_Var": [pc1_var] * len(sec_ids),
-    })
+    }
+    if has_date:
+        out["date"] = [group["date"][0]] * len(sec_ids)
+    return pl.DataFrame(out)
 
 
 def _compute_ofi_pca(df: pl.DataFrame) -> pl.DataFrame:
@@ -2257,18 +2329,25 @@ def _compute_ofi_pca(df: pl.DataFrame) -> pl.DataFrame:
     if not all(c in df.columns for c in ["OFI_1", "OFI", "OFI_10"]):
         return df  # can't compute
 
+    # Use date-aware grouping to prevent cross-day section mixing
+    has_date = "date" in df.columns
+    g_cols = ["date", "timestamp"] if has_date else ["timestamp"]
+    select_cols = ["SecurityID"] + g_cols + ["OFI_1", "OFI", "OFI_10"]
+
     # Keep only rows with all three OFI values
-    sub = df.select(["SecurityID", "timestamp", "OFI_1", "OFI", "OFI_10"]).drop_nulls()
+    sub = df.select(select_cols).drop_nulls()
 
     # Per-timestamp PCA via group_by + map_groups
-    result = sub.group_by("timestamp", maintain_order=True).map_groups(
+    result = sub.group_by(g_cols, maintain_order=True).map_groups(
         _ofi_pca_per_timestamp
     )
 
     # Join back to main df
+    join_on = ["SecurityID"] + g_cols
+    result_cols = ["SecurityID"] + g_cols + ["OFI_PC1", "OFI_Residual", "OFI_PC1_Var"]
     return df.join(
-        result.select(["SecurityID", "timestamp", "OFI_PC1", "OFI_Residual", "OFI_PC1_Var"]),
-        on=["SecurityID", "timestamp"], how="left"
+        result.select(result_cols),
+        on=join_on, how="left"
     )
 
 

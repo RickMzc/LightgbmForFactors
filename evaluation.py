@@ -63,23 +63,27 @@ class CrossSectionalEvaluator:
         label_col: str = "ret_15s",
         min_stocks: int = MIN_STOCKS,
     ) -> pl.DataFrame:
-        """Compute Spearman Rank-IC for each 3s timestamp slice.
+        """Compute Spearman Rank-IC for each (date, timestamp) cross-section.
 
         Parameters
         ----------
-        df : DataFrame with columns [timestamp, pred_col, label_col].
+        df : DataFrame with columns [date, timestamp, pred_col, label_col].
         pred_col : model prediction column.
         label_col : ground-truth forward return column.
-        min_stocks : minimum stocks per timestamp to compute IC.
+        min_stocks : minimum stocks per cross-section to compute IC.
 
         Returns
         -------
-        DataFrame with columns [timestamp, n_stocks, rank_ic].
+        DataFrame with columns [date, timestamp, n_stocks, rank_ic].
         """
+        # Use ["date","timestamp"] to prevent cross-day pooling
+        has_date = "date" in df.columns
+        group_cols = ["date", "timestamp"] if has_date else ["timestamp"]
+
         ic_df = (
-            df.select(["timestamp", pred_col, label_col])
+            df.select(group_cols + [pred_col, label_col])
             .drop_nulls()
-            .group_by("timestamp")
+            .group_by(group_cols)
             .agg([
                 pl.len().alias("n_stocks"),
                 pl.corr(pred_col, label_col, method="spearman").alias("rank_ic"),
@@ -88,7 +92,7 @@ class CrossSectionalEvaluator:
                 (pl.col("n_stocks") >= min_stocks)
                 & pl.col("rank_ic").is_not_nan()
             )
-            .sort("timestamp")
+            .sort(group_cols)
         )
 
         return ic_df
@@ -99,6 +103,7 @@ class CrossSectionalEvaluator:
         labels: np.ndarray,
         timestamps: pl.Series | np.ndarray,
         security_ids: pl.Series | np.ndarray,
+        dates: pl.Series | np.ndarray | None = None,
         horizon: str = "ret_15s",
     ) -> EvalResult:
         """Compute full evaluation for one horizon.
@@ -109,17 +114,23 @@ class CrossSectionalEvaluator:
         labels : true forward returns (float array, shape n).
         timestamps : timestamp array (same length as predictions).
         security_ids : SecurityID array (same length as predictions).
+        dates : date array (same length as predictions).  If None,
+               daily_ic grouping is skipped.
         horizon : label name (e.g. "ret_15s").
         """
         n = len(predictions)
         assert len(labels) == n, f"Labels length {len(labels)} != preds {n}"
 
-        eval_df = pl.DataFrame({
+        eval_cols: dict[str, pl.Series] = {
             "timestamp": pl.Series(timestamps) if not isinstance(timestamps, pl.Series) else timestamps,
             "SecurityID": pl.Series(security_ids) if not isinstance(security_ids, pl.Series) else security_ids,
             "prediction": pl.Series(predictions.astype(np.float64)),
             "label": pl.Series(labels.astype(np.float64)),
-        })
+        }
+        if dates is not None:
+            eval_cols["date"] = pl.Series(dates) if not isinstance(dates, pl.Series) else dates
+
+        eval_df = pl.DataFrame(eval_cols)
 
         ic_df = self.rank_ic_per_timestamp(
             eval_df, pred_col="prediction", label_col="label",
@@ -168,6 +179,7 @@ class CrossSectionalEvaluator:
         labels_dict: dict[str, np.ndarray],
         timestamps: pl.Series,
         security_ids: pl.Series,
+        dates: pl.Series | None = None,
     ) -> dict[str, EvalResult]:
         """Evaluate predictions against multiple horizons simultaneously.
 
@@ -175,7 +187,9 @@ class CrossSectionalEvaluator:
         ----------
         predictions : model predictions.
         labels_dict : {horizon_name: label_array}.
-        timestamps, security_ids : metadata arrays.
+        timestamps, security_ids, dates : metadata arrays.
+            dates is required for multi-day evaluation to
+            prevent cross-day section pooling.
 
         Returns
         -------
@@ -184,7 +198,8 @@ class CrossSectionalEvaluator:
         results = {}
         for horizon, labels in labels_dict.items():
             results[horizon] = self.evaluate(
-                predictions, labels, timestamps, security_ids, horizon,
+                predictions, labels, timestamps, security_ids,
+                dates=dates, horizon=horizon,
             )
         return results
 

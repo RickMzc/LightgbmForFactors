@@ -13,7 +13,7 @@ from __future__ import annotations
 import polars as pl
 
 from ml_framework.config import (
-    HORIZONS, HORIZON_NAMES, HORIZON_SHIFTS,
+    HORIZONS, HORIZON_NAMES, HORIZON_SHIFTS, HORIZON_SECONDS,
     LUNCH_START, LUNCH_END, MARKET_CLOSE, EPS,
 )
 
@@ -80,14 +80,27 @@ class LabelGenerator:
         CRITICAL: .shift(-h).over("SecurityID") — without .over(), Polars
         shifts across the full DataFrame, contaminating stocks with each
         other's prices.
+
+        Additionally validates that the actual time gap at the shifted rows
+        equals the expected horizon seconds (±3s tolerance).  When a stock
+        has missing snapshots, shift(-5) may traverse more than 15 seconds,
+        producing a false horizon label.
         """
         ln_mid = pl.col("mid_price").log()
+        ts = pl.col("timestamp")
 
         exprs = [ln_mid.alias("ln_mid")]
-        for name, shift in zip(self._horizon_names, self._horizon_shifts):
-            fwd_ln = ln_mid.shift(-shift).over("SecurityID")
+        for name, shift_h, horizon_secs in zip(
+            self._horizon_names, self._horizon_shifts,
+            [HORIZON_SECONDS[n] for n in self._horizon_names],
+        ):
+            fwd_ln = ln_mid.shift(-shift_h).over("SecurityID")
+            fwd_ts = ts.shift(-shift_h).over("SecurityID")
+            # Validate actual time gap; allow ±3s tolerance
+            gap_ok = (fwd_ts - ts - pl.lit(horizon_secs)).abs() <= 3
+            raw_ret = fwd_ln - ln_mid
             exprs.append(
-                (fwd_ln - ln_mid).alias(name)
+                pl.when(gap_ok).then(raw_ret).otherwise(None).alias(name)
             )
 
         return df.with_columns(exprs)

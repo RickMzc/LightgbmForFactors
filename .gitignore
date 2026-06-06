@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*代码审查*.md
+FEATURE_REVIEW_REPORT.md

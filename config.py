@@ -28,6 +28,8 @@ HORIZONS: dict[str, int] = {
 }
 HORIZON_NAMES: list[str] = list(HORIZONS.keys())
 HORIZON_SHIFTS: list[int] = list(HORIZONS.values())
+# Expected clock-time seconds for each horizon (for gap validation)
+HORIZON_SECONDS: dict[str, int] = {k: v * 3 for k, v in HORIZONS.items()}
 
 # ---- Trading calendar (3s-bucket seconds) ----
 MARKET_OPEN: int  = 34200   # 09:30:00

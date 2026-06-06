@@ -162,11 +162,12 @@ class AlphaModel:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pl.DataFrame]:
         """Extract feature matrix, target vector, stock IDs, and filtered df.
 
-        Requires a pre-computed 'stock_id' column (global integer encoding of
-        SecurityID) in the input DataFrame.  Caller is responsible for creating
-        this column once on the full dataset before any train/val/test split.
+        Only drops rows where target or key columns are null.  Feature nulls
+        are preserved and handled by LightGBM's native missing-value support.
+        This prevents systematic exclusion of Shenzhen stocks (which lack
+        MaxDurPressure) and quiet buckets from the training set.
         """
-        valid = df.drop_nulls(subset=[self._target_col] + self._feature_cols)
+        valid = df.drop_nulls(subset=[self._target_col, "date", "timestamp", "SecurityID"])
 
         X = valid.select(self._feature_cols).to_numpy().astype(np.float64)
         y = valid.select(self._target_col).to_numpy().ravel().astype(np.float64)
