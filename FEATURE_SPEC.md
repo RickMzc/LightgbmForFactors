@@ -394,7 +394,7 @@ NearLimitDown 时: 1 − BidVol_1..3 / (BidVol_1..3 + AskVol_1..3)
 
 ## ⑥ 逐笔成交特征 — 11 个
 
-> SH 用 `TradeBSFlag`（B/S），SZ 用 tick rule（Lee-Ready）判方向。SZ 的 `ExecType=52`（Price=0）是混入成交流的撤单，已过滤。大单阈值 = 该股票当日成交额 90% 分位。
+> SH 用 `TradeBSFlag`（B/S），SZ 用 tick rule（Lee-Ready）判方向。SZ 的 `ExecType=52`（Price=0）是混入成交流的撤单，已过滤。大单阈值 = **前一交易日**该股票成交额 90% 分位（缓存于 `/fast1/user001/factor_values/_trade_thresh/`），首个交易日无历史时大单相关特征为 null。
 
 ### TradeImb — 成交流不平衡
 ```
@@ -459,7 +459,7 @@ LargeTradeRatio = (LargeBuy − LargeSell) / (LargeBuy + LargeSell)
 
 ## ⑦ 逐笔委托特征 — 14 个
 
-> SH: `OrderBSFlag` (B/S), `OrderType` (A=新增/D=撤单)。SZ: `Side` (49=买/50=卖), `OrdType` (49=新增/50=撤单/85=修改)。SZ 的 `Price=0`（市价单）已从价格敏感特征中剔除。大单阈值 = 该股票当日委托量 90% 分位。
+> SH: `OrderBSFlag` (B/S), `OrderType` (A=新增/D=撤单)。SZ: `Side` (49=买/50=卖), `OrdType` (49=新增/50=撤单/85=修改)。SZ 的 `Price=0`（市价单）已从价格敏感特征中剔除。大单阈值 = **前一交易日**该股票委托金额 90% 分位（缓存于 `/fast1/user001/factor_values/_order_thresh/`），首个交易日无历史时大单相关特征为 null。委托时间用 `_ceil_3s` 右端分桶（与成交一致），深度统计用 tick-level `join_asof(strategy="backward")` 匹配委托前最近快照，且仅统计新增委托（`is_new`），撤单不参与深度分布。
 
 ### CancelRateImb — 撤单率不平衡
 ```
